@@ -1,24 +1,62 @@
 {
-  "name": "simple-socks",
-  "version": "1.0.0",
-  "description": "A simple SOCKS5 server implementation",
-  "main": "dist/socks5.js",
-  "types": "dist/socks5.d.ts",
+  "name": "@apofasi/socks",
+  "version": "1.1.0",
+  "description": "A modern SOCKS5 server implementation with TypeScript support, forked from simple-socks",
+  "main": "dist/server.js",
+  "types": "dist/server.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc",
-    "start": "node dist/socks5.js",
-    "dev": "ts-node src/socks5.ts",
-    "test": "jest"
+    "clean": "rimraf dist",
+    "prebuild": "npm run clean",
+    "prepublishOnly": "npm run test && npm run build",
+    "test": "jest",
+    "lint": "eslint src/**/*.ts",
+    "format": "prettier --write \"src/**/*.ts\" \"__tests__/**/*.ts\"",
+    "publish-patch": "npm version patch && npm publish",
+    "publish-minor": "npm version minor && npm publish",
+    "publish-major": "npm version major && npm publish",
+    "version": "git add -A",
+    "postversion": "git push && git push --tags"
   },
-  "dependencies": {
-    "socks": "^2.8.3"
+  "keywords": [
+    "socks",
+    "socks5",
+    "proxy",
+    "typescript",
+    "server"
+  ],
+  "author": "Apofasi",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/apofasi/socks.git"
   },
+  "bugs": {
+    "url": "https://github.com/apofasi/socks/issues"
+  },
+  "homepage": "https://github.com/apofasi/socks#readme",
+  "dependencies": {},
   "devDependencies": {
     "@types/jest": "^29.5.12",
     "@types/node": "^20.11.24",
     "jest": "^29.7.0",
+    "prettier": "^3.2.5",
+    "rimraf": "^5.0.5",
     "ts-jest": "^29.1.2",
-    "ts-node": "^10.9.2",
-    "typescript": "^5.3.3"
+    "typescript": "^5.3.3",
+    "eslint": "^8.56.0",
+    "@typescript-eslint/parser": "^6.21.0",
+    "@typescript-eslint/eslint-plugin": "^6.21.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=14.0.0"
   }
 }
