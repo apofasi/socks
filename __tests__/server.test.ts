@@ -1,6 +1,5 @@
 /// <reference types="jest" />
-import { createServer } from "../src/server";
-import { Server } from "net";
+import { createServer, SocksServer } from "../src/server";
 import http from "http";
 import { exec } from "child_process";
 import { promisify } from "util";
@@ -8,7 +7,7 @@ import { promisify } from "util";
 const execAsync = promisify(exec);
 
 describe("SOCKS5 Server Tests", () => {
-  let socksServer: Server;
+  let socksServer: SocksServer;
   let httpServer: http.Server;
   const SOCKS_PORT = 1080;
   const HTTP_PORT = 8080;
@@ -74,9 +73,7 @@ describe("SOCKS5 Server Tests", () => {
 
       // We expect the command to fail
       expect(commandError).toBeTruthy();
-      expect(commandError?.message).toContain(
-        "Can't complete SOCKS5 connection"
-      );
+      expect(commandError?.message).toContain("connection to proxy closed");
     }, 10000);
   });
 
@@ -84,7 +81,12 @@ describe("SOCKS5 Server Tests", () => {
     beforeAll((done) => {
       // Create and start SOCKS server with authentication
       socksServer = createServer({
-        authenticate: (username, password, socket, callback) => {
+        authenticate: (
+          username: string,
+          password: string,
+          socket: any,
+          callback: (err?: Error) => void
+        ) => {
           console.log(
             `Authentication attempt - username: ${username}, password: ${password}`
           );

@@ -8,9 +8,15 @@ import {
   RFC_1929_VERSION,
 } from "./constants";
 
-import binary from "binary";
 import net, { Socket, Server } from "net";
 import { Duplex } from "stream";
+import {
+  parseAuthRequest,
+  parseConnectRequest,
+  parseIPv4Address,
+  parseIPv6Address,
+  parseDomainName,
+} from "./binary";
 
 // Define interfaces and types
 export interface SocksServerOptions {
@@ -42,32 +48,6 @@ function defaultSocketFactory(address: string, port: number): Promise<Duplex> {
   });
 }
 
-interface BinaryStreamArgs {
-  ver: number;
-  cmd?: number;
-  rsv?: number;
-  atyp?: number;
-  requestBuffer?: Buffer;
-  dst?: {
-    addr?: string;
-    port?: number;
-  };
-  addr?: {
-    buf?: Buffer;
-    size?: number;
-    a?: number;
-    b?: number;
-    c?: number;
-    d?: number;
-  };
-  ulen?: number;
-  uname?: Buffer;
-  plen?: number;
-  passwd?: Buffer;
-  methods?: Buffer;
-  nmethods?: number;
-}
-
 // Module specific events
 export const EVENTS = {
   AUTHENTICATION: "authenticate",
@@ -80,8 +60,6 @@ export const EVENTS = {
   PROXY_END: "proxyEnd",
   PROXY_ERROR: "proxyError",
 } as const;
-
-const LENGTH_RFC_1928_ATYP = 4;
 
 /**
  * The following RFCs may be useful as background:
@@ -113,60 +91,47 @@ export class SocksServer {
        * +----+------+----------+------+----------+
        **/
       function authenticate(buffer: Buffer): void {
-        binary
-          .stream(buffer)
-          .word8("ver")
-          .word8("ulen")
-          .buffer("uname", "ulen")
-          .word8("plen")
-          .buffer("passwd", "plen")
-          .tap((args: BinaryStreamArgs) => {
-            // capture the raw buffer
-            args.requestBuffer = buffer;
+        const request = parseAuthRequest(buffer);
 
-            // verify version is appropriate
-            if (args.ver !== RFC_1929_VERSION) {
-              return end(RFC_1929_REPLIES.GENERAL_FAILURE, args);
+        // verify version is appropriate
+        if (request.ver !== RFC_1929_VERSION) {
+          return end(RFC_1929_REPLIES.GENERAL_FAILURE, request);
+        }
+
+        // perform authentication
+        if (self.options.authenticate) {
+          self.options.authenticate(
+            request.uname.toString(),
+            request.passwd.toString(),
+            socket,
+            (err?: Error) => {
+              if (err) {
+                // emit failed authentication event
+                self.server.emit(
+                  EVENTS.AUTHENTICATION_ERROR,
+                  request.uname.toString(),
+                  err
+                );
+                // respond with auth failure
+                return end(RFC_1929_REPLIES.GENERAL_FAILURE, request);
+              }
+
+              // emit successful authentication event
+              self.server.emit(EVENTS.AUTHENTICATION, request.uname.toString());
+
+              // respond with success...
+              const responseBuffer = Buffer.allocUnsafe(2);
+              responseBuffer[0] = RFC_1929_VERSION;
+              responseBuffer[1] = RFC_1929_REPLIES.SUCCEEDED;
+
+              // respond then listen for cmd and dst info
+              socket.write(responseBuffer, () => {
+                // now listen for more details
+                socket.once("data", connect);
+              });
             }
-
-            // perform authentication
-            if (self.options.authenticate) {
-              self.options.authenticate(
-                args.uname!.toString(),
-                args.passwd!.toString(),
-                socket,
-                (err?: Error) => {
-                  if (err) {
-                    // emit failed authentication event
-                    self.server.emit(
-                      EVENTS.AUTHENTICATION_ERROR,
-                      args.uname!.toString(),
-                      err
-                    );
-                    // respond with auth failure
-                    return end(RFC_1929_REPLIES.GENERAL_FAILURE, args);
-                  }
-
-                  // emit successful authentication event
-                  self.server.emit(
-                    EVENTS.AUTHENTICATION,
-                    args.uname!.toString()
-                  );
-
-                  // respond with success...
-                  const responseBuffer = Buffer.allocUnsafe(2);
-                  responseBuffer[0] = RFC_1929_VERSION;
-                  responseBuffer[1] = RFC_1929_REPLIES.SUCCEEDED;
-
-                  // respond then listen for cmd and dst info
-                  socket.write(responseBuffer, () => {
-                    // now listen for more details
-                    socket.once("data", connect);
-                  });
-                }
-              );
-            }
-          });
+          );
+        }
       }
 
       /**
@@ -177,347 +142,170 @@ export class SocksServer {
        * +----+-----+-------+------+----------+----------+
        **/
       function connect(buffer: Buffer): void {
-        const binaryStream = binary.stream(buffer);
+        const request = parseConnectRequest(buffer);
 
-        binaryStream
-          .word8("ver")
-          .word8("cmd")
-          .word8("rsv")
-          .word8("atyp")
-          .tap((args: BinaryStreamArgs) => {
-            // capture the raw buffer
-            args.requestBuffer = buffer;
-
-            // verify version is appropriate
-            if (args.ver !== RFC_1928_VERSION) {
-              return end(RFC_1928_REPLIES.GENERAL_FAILURE, args);
-            }
-
-            // append socket to active sessions
-            self.activeSessions.push(socket);
-
-            // create dst
-            args.dst = {};
-
-            // ipv4
-            if (args.atyp === RFC_1928_ATYP.IPV4) {
-              binaryStream
-                .buffer("addr.buf", LENGTH_RFC_1928_ATYP)
-                .tap((args: BinaryStreamArgs) => {
-                  args.dst!.addr = Array.from(args.addr!.buf!).join(".");
-                });
-
-              // domain name
-            } else if (args.atyp === RFC_1928_ATYP.DOMAINNAME) {
-              binaryStream
-                .word8("addr.size")
-                .buffer("addr.buf", "addr.size")
-                .tap((args: BinaryStreamArgs) => {
-                  args.dst!.addr = args.addr!.buf!.toString();
-                });
-
-              // ipv6
-            } else if (args.atyp === RFC_1928_ATYP.IPV6) {
-              binaryStream
-                .word32be("addr.a")
-                .word32be("addr.b")
-                .word32be("addr.c")
-                .word32be("addr.d")
-                .tap((args: BinaryStreamArgs) => {
-                  const ipv6Parts: string[] = [];
-
-                  // extract the parts of the ipv6 address
-                  ["a", "b", "c", "d"].forEach((x) => {
-                    const value = args.addr![
-                      x as keyof typeof args.addr
-                    ] as number;
-
-                    // convert DWORD to two WORD values and append
-                    /* eslint no-magic-numbers : 0 */
-                    ipv6Parts.push((value >>> 16).toString(16));
-                    ipv6Parts.push((value & 0xffff).toString(16));
-                  });
-
-                  // format ipv6 address as string
-                  if (args.dst) {
-                    args.dst.addr = ipv6Parts.join(":");
-                  }
-                });
-
-              // unsupported address type
-            } else {
-              return end(RFC_1928_REPLIES.ADDRESS_TYPE_NOT_SUPPORTED, args);
-            }
-          })
-          .word16bu("dst.port")
-          .tap((args: BinaryStreamArgs) => {
-            if (args.cmd === RFC_1928_COMMANDS.CONNECT) {
-              let connectionFilter = self.options.connectionFilter;
-
-              // if no connection filter is provided, stub one
-              if (!connectionFilter || typeof connectionFilter !== "function") {
-                connectionFilter = (destination, origin, callback) =>
-                  setImmediate(callback);
-              }
-
-              // perform connection
-              connectionFilter(
-                // destination
-                {
-                  address: args.dst!.addr!,
-                  port: args.dst!.port!,
-                },
-                // origin
-                {
-                  address: socket.remoteAddress!,
-                  port: socket.remotePort!,
-                },
-                (err?: Error) => {
-                  if (err) {
-                    // emit failed destination connection event
-                    self.server.emit(
-                      EVENTS.CONNECTION_FILTER,
-                      // destination
-                      {
-                        address: args.dst!.addr,
-                        port: args.dst!.port,
-                      },
-                      // origin
-                      {
-                        address: socket.remoteAddress,
-                        port: socket.remotePort,
-                      },
-                      err
-                    );
-
-                    // respond with failure
-                    return end(RFC_1928_REPLIES.CONNECTION_NOT_ALLOWED, args);
-                  }
-
-                  const socketFactory =
-                    self.options.socketFactory || defaultSocketFactory;
-
-                  const destinationInfo = {
-                    address: args.dst!.addr!,
-                    port: args.dst!.port!,
-                  };
-
-                  const originInfo = {
-                    address: socket.remoteAddress!,
-                    port: socket.remotePort!,
-                  };
-
-                  socketFactory(args.dst!.addr!, args.dst!.port!)
-                    .then((destination: Duplex) => {
-                      // emit connection event
-                      self.server.emit(
-                        EVENTS.PROXY_CONNECT,
-                        destinationInfo,
-                        destination
-                      );
-
-                      // emit connection event
-                      self.server.emit(
-                        EVENTS.PROXY_CONNECT,
-                        destinationInfo,
-                        destination
-                      );
-
-                      // capture and emit proxied connection data
-                      destination.on("data", (data: Buffer) => {
-                        self.server.emit(EVENTS.PROXY_DATA, data);
-                      });
-
-                      // capture close of destination and emit pending disconnect
-                      // note: this event is only emitted once the destination socket is fully closed
-                      destination.on("close", (hadError: boolean) => {
-                        // indicate client connection end
-                        self.server.emit(
-                          EVENTS.PROXY_DISCONNECT,
-                          originInfo,
-                          destinationInfo,
-                          hadError
-                        );
-                      });
-
-                      // prepare a success response
-                      const responseBuffer = Buffer.alloc(
-                        args.requestBuffer!.length
-                      );
-                      args.requestBuffer!.copy(responseBuffer);
-                      responseBuffer[1] = RFC_1928_REPLIES.SUCCEEDED;
-
-                      // write acknowledgement to client...
-                      socket.write(responseBuffer, () => {
-                        // listen for data bi-directionally
-                        destination.pipe(socket);
-                        socket.pipe(destination);
-                      });
-
-                      destination.on(
-                        "error",
-                        (
-                          err: Error & {
-                            code?: string;
-                            addr?: string;
-                            atyp?: number;
-                            port?: number;
-                          }
-                        ) => {
-                          // notify of connection error
-                          err.addr = args.dst!.addr;
-                          err.atyp = args.atyp;
-                          err.port = args.dst!.port;
-
-                          self.server.emit(EVENTS.PROXY_ERROR, err);
-
-                          if (err.code && err.code === "EADDRNOTAVAIL") {
-                            return end(RFC_1928_REPLIES.HOST_UNREACHABLE, args);
-                          }
-
-                          if (err.code && err.code === "ECONNREFUSED") {
-                            return end(
-                              RFC_1928_REPLIES.CONNECTION_REFUSED,
-                              args
-                            );
-                          }
-
-                          return end(
-                            RFC_1928_REPLIES.NETWORK_UNREACHABLE,
-                            args
-                          );
-                        }
-                      );
-                    })
-                    .catch((err) => {
-                      self.server.emit(EVENTS.PROXY_ERROR, err);
-
-                      if (err.code && err.code === "EADDRNOTAVAIL") {
-                        return end(RFC_1928_REPLIES.HOST_UNREACHABLE, args);
-                      }
-
-                      if (err.code && err.code === "ECONNREFUSED") {
-                        return end(RFC_1928_REPLIES.CONNECTION_REFUSED, args);
-                      }
-
-                      return end(RFC_1928_REPLIES.NETWORK_UNREACHABLE, args);
-                    });
-                }
-              );
-            } else {
-              // bind and udp associate commands
-              return end(RFC_1928_REPLIES.SUCCEEDED, args);
-            }
-          });
-      }
-
-      /**
-       * +----+-----+-------+------+----------+----------+
-       * |VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
-       * +----+-----+-------+------+----------+----------+
-       * | 1  |  1  | X'00' |  1   | Variable |    2     |
-       * +----+-----+-------+------+----------+----------+
-       **/
-      function end(response: number, args: BinaryStreamArgs): void {
-        // either use the raw buffer (if available) or create a new one
-        const responseBuffer = args.requestBuffer || Buffer.allocUnsafe(2);
-
-        if (!args.requestBuffer) {
-          responseBuffer[0] = RFC_1928_VERSION;
+        // verify version is appropriate
+        if (request.ver !== RFC_1928_VERSION) {
+          return end(RFC_1928_REPLIES.GENERAL_FAILURE, request);
         }
 
-        responseBuffer[1] = response;
+        // append socket to active sessions
+        self.activeSessions.push(socket);
 
-        // respond then end the connection
-        try {
-          socket.end(responseBuffer);
-        } catch (ex) {
-          socket.destroy();
+        let dst = { addr: "", port: 0 };
+
+        // ipv4
+        if (request.atyp === RFC_1928_ATYP.IPV4) {
+          dst.addr = parseIPv4Address(request.remaining.subarray(0, 4));
+          dst.port = request.remaining.readUInt16BE(4);
+        }
+        // domain name
+        else if (request.atyp === RFC_1928_ATYP.DOMAINNAME) {
+          const domain = parseDomainName(request.remaining);
+          dst.addr = domain.addr;
+          dst.port = request.remaining.readUInt16BE(domain.size + 1);
+        }
+        // ipv6
+        else if (request.atyp === RFC_1928_ATYP.IPV6) {
+          dst.addr = parseIPv6Address(request.remaining.subarray(0, 16));
+          dst.port = request.remaining.readUInt16BE(16);
+        }
+        // unsupported address type
+        else {
+          return end(RFC_1928_REPLIES.ADDRESS_TYPE_NOT_SUPPORTED, request);
         }
 
-        // indicate end of connection
-        self.server.emit(EVENTS.PROXY_END, response, args);
-      }
+        // create outbound socket
+        const outboundSocket = self.options.socketFactory
+          ? self.options.socketFactory(dst.addr, dst.port)
+          : defaultSocketFactory(dst.addr, dst.port);
 
-      /**
-       * +----+----------+----------+
-       * |VER | NMETHODS | METHODS  |
-       * +----+----------+----------+
-       * | 1  |    1     | 1 to 255 |
-       * +----+----------+----------+
-       **/
-      function handshake(buffer: Buffer): void {
-        binary
-          .stream(buffer)
-          .word8("ver")
-          .word8("nmethods")
-          .buffer("methods", "nmethods")
-          .tap((args: BinaryStreamArgs) => {
-            // verify version is appropriate
-            if (args.ver !== RFC_1928_VERSION) {
-              return end(RFC_1928_REPLIES.GENERAL_FAILURE, args);
-            }
-
-            // convert methods buffer to an array
-            const acceptedMethods = Array.from(
-              args.methods || Buffer.alloc(0)
-            ).reduce((methods: { [key: number]: boolean }, method: number) => {
-              methods[method] = true;
-              return methods;
-            }, {});
-
-            const basicAuth = typeof self.options.authenticate === "function";
-            let next = connect;
-            const noAuth =
-              !basicAuth &&
-              typeof acceptedMethods[0] !== "undefined" &&
-              acceptedMethods[0];
-
-            const responseBuffer = Buffer.allocUnsafe(2);
-
-            // form response Buffer
+        // handle connection response
+        outboundSocket
+          .then((targetSocket) => {
+            // prepare response
+            const responseBuffer = Buffer.allocUnsafe(
+              request.requestBuffer.length
+            );
             responseBuffer[0] = RFC_1928_VERSION;
-            responseBuffer[1] = RFC_1928_METHODS.NO_AUTHENTICATION_REQUIRED;
+            responseBuffer[1] = RFC_1928_REPLIES.SUCCEEDED;
+            responseBuffer[2] = 0x00;
 
-            // check for basic auth configuration
-            if (basicAuth) {
-              responseBuffer[1] = RFC_1928_METHODS.BASIC_AUTHENTICATION;
-              next = authenticate;
+            // copy the remaining buffer from the request
+            request.requestBuffer.copy(responseBuffer, 3, 3);
 
-              // if NO AUTHENTICATION REQUIRED and
-            } else if (!basicAuth && noAuth) {
-              responseBuffer[1] = RFC_1928_METHODS.NO_AUTHENTICATION_REQUIRED;
-              next = connect;
-
-              // basic auth callback not provided and no auth is not supported
-            } else {
-              return end(RFC_1928_METHODS.NO_ACCEPTABLE_METHODS, args);
-            }
-
-            // respond then listen for cmd and dst info
+            // write response and establish proxy
             socket.write(responseBuffer, () => {
-              // emit handshake event
-              self.server.emit(EVENTS.HANDSHAKE, socket);
-
-              // now listen for more details
-              socket.once("data", next);
+              targetSocket.pipe(socket);
+              socket.pipe(targetSocket);
             });
+          })
+          .catch((err) => {
+            end(RFC_1928_REPLIES.GENERAL_FAILURE, request);
+            self.server.emit(EVENTS.PROXY_ERROR, err);
           });
       }
 
-      // capture the client handshake
-      socket.once("data", handshake);
+      function end(code: number, args: { requestBuffer: Buffer }): void {
+        // prepare response
+        const responseBuffer = Buffer.allocUnsafe(2);
+        responseBuffer[0] = RFC_1928_VERSION;
+        responseBuffer[1] = code;
 
-      // capture socket closure
-      socket.once("end", () => {
-        // remove the session from currently the active sessions list
-        self.activeSessions.splice(self.activeSessions.indexOf(socket), 1);
+        // write response and end socket
+        socket.write(responseBuffer, () => socket.end());
+      }
+
+      // capture the handshake and allow for authentication if configured
+      socket.once("data", (buffer) => {
+        // verify version and auth methods
+        if (buffer[0] !== RFC_1928_VERSION || buffer[1] !== buffer.length - 2) {
+          return end(RFC_1928_REPLIES.GENERAL_FAILURE, {
+            requestBuffer: buffer,
+          });
+        }
+
+        // convert methods buffer to array
+        const methods = Array.prototype.slice.call(buffer, 2);
+
+        // ensure options.authenticate is properly setup if authentication method is requested
+        if (
+          methods.includes(RFC_1928_METHODS.BASIC_AUTHENTICATION) &&
+          !self.options.authenticate
+        ) {
+          return end(RFC_1928_REPLIES.GENERAL_FAILURE, {
+            requestBuffer: buffer,
+          });
+        }
+
+        // if authentication is configured and the client supports it, use it
+        if (
+          self.options.authenticate &&
+          methods.includes(RFC_1928_METHODS.BASIC_AUTHENTICATION)
+        ) {
+          // respond with basic auth request
+          const responseBuffer = Buffer.from([
+            RFC_1928_VERSION,
+            RFC_1928_METHODS.BASIC_AUTHENTICATION,
+          ]);
+
+          // write response and await authentication
+          return socket.write(responseBuffer, () => {
+            socket.once("data", authenticate);
+          });
+        }
+
+        // if no authentication is configured and client supports it, use it
+        if (
+          !self.options.authenticate &&
+          methods.includes(RFC_1928_METHODS.NO_AUTHENTICATION_REQUIRED)
+        ) {
+          // respond with no auth required
+          const responseBuffer = Buffer.from([
+            RFC_1928_VERSION,
+            RFC_1928_METHODS.NO_AUTHENTICATION_REQUIRED,
+          ]);
+
+          // write response and await connection details
+          return socket.write(responseBuffer, () => {
+            socket.once("data", connect);
+          });
+        }
+
+        // no supported authentication methods
+        return end(RFC_1928_METHODS.NO_ACCEPTABLE_METHODS, {
+          requestBuffer: buffer,
+        });
       });
     });
   }
+
+  /**
+   * Closes the server and all active sessions
+   */
+  close(callback?: (err?: Error) => void): void {
+    this.activeSessions.forEach((session) => session.end());
+    this.server.close(callback);
+  }
+
+  /**
+   * Returns the address the server is listening on
+   */
+  address() {
+    return this.server.address();
+  }
+
+  /**
+   * Start listening for connections on the given port and host
+   */
+  listen(port: number, host?: string, callback?: () => void): void {
+    this.server.listen(port, host, callback);
+  }
 }
 
-export const createServer = (options?: SocksServerOptions): Server => {
-  const socksServer = new SocksServer(options);
-  return socksServer.server;
-};
+/**
+ * Creates a new SOCKS5 server instance
+ */
+export function createServer(options?: SocksServerOptions): SocksServer {
+  return new SocksServer(options);
+}
