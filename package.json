@@ -1,46 +1,24 @@
 {
   "name": "simple-socks",
-  "version": "3.1.0",
-  "description": "proxies requests ",
-  "type": "module",
-  "main": "src/socks5.js",
-  "engine": "node >= 16.0",
+  "version": "1.0.0",
+  "description": "A simple SOCKS5 server implementation",
+  "main": "dist/socks5.js",
+  "types": "dist/socks5.d.ts",
   "scripts": {
-    "lint": "gulp lint",
-    "test": "gulp lint"
-  },
-  "author": "https://github.com/brozeph",
-  "contributors": [
-    "https://github.com/pronskiy",
-    "https://github.com/fabiensk",
-    "https://github.com/lanius-collaris"
-  ],
-  "license": "MIT",
-  "keywords": [
-    "socks",
-    "socks5",
-    "socksv5",
-    "rfc 1928",
-    "rfc1928",
-    "rfc 1929",
-    "rfc1929",
-    "socks server",
-    "socks5 server",
-    "socksv5 server"
-  ],
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/brozeph/simple-socks.git"
-  },
-  "bugs": {
-    "url": "http://github.com/brozeph/simple-socks/issues"
-  },
-  "devDependencies": {
-    "eslint": "^8.21.0",
-    "gulp": "^4.0.2",
-    "gulp-eslint": "^6.0.0"
+    "build": "tsc",
+    "start": "node dist/socks5.js",
+    "dev": "ts-node src/socks5.ts",
+    "test": "jest"
   },
   "dependencies": {
     "binary": "^0.3.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.12",
+    "@types/node": "^20.11.24",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.2",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3"
   }
 }
