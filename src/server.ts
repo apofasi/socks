@@ -10,6 +10,7 @@ import {
 
 import binary from "binary";
 import net, { Socket, Server } from "net";
+import { Duplex } from "stream";
 
 // Define interfaces and types
 export interface SocksServerOptions {
@@ -24,6 +25,21 @@ export interface SocksServerOptions {
     origin: { address: string; port: number },
     callback: (err?: Error) => void
   ) => void;
+  socketFactory?: (address: string, port: number) => Promise<Duplex>;
+}
+
+function defaultSocketFactory(address: string, port: number): Promise<Duplex> {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection(port, address, () => {
+      socket.removeListener("error", handleError);
+      resolve(socket);
+    });
+    const handleError = (err: any) => {
+      socket.removeListener("error", handleError);
+      reject(err);
+    };
+    socket.once("error", handleError);
+  });
 }
 
 interface BinaryStreamArgs {
@@ -278,10 +294,52 @@ export class SocksServer {
                     return end(RFC_1928_REPLIES.CONNECTION_NOT_ALLOWED, args);
                   }
 
-                  const destination = net.createConnection(
-                    args.dst!.port!,
-                    args.dst!.addr!,
-                    () => {
+                  const socketFactory =
+                    self.options.socketFactory || defaultSocketFactory;
+
+                  const destinationInfo = {
+                    address: args.dst!.addr!,
+                    port: args.dst!.port!,
+                  };
+
+                  const originInfo = {
+                    address: socket.remoteAddress!,
+                    port: socket.remotePort!,
+                  };
+
+                  socketFactory(args.dst!.addr!, args.dst!.port!)
+                    .then((destination: Duplex) => {
+                      // emit connection event
+                      self.server.emit(
+                        EVENTS.PROXY_CONNECT,
+                        destinationInfo,
+                        destination
+                      );
+
+                      // emit connection event
+                      self.server.emit(
+                        EVENTS.PROXY_CONNECT,
+                        destinationInfo,
+                        destination
+                      );
+
+                      // capture and emit proxied connection data
+                      destination.on("data", (data: Buffer) => {
+                        self.server.emit(EVENTS.PROXY_DATA, data);
+                      });
+
+                      // capture close of destination and emit pending disconnect
+                      // note: this event is only emitted once the destination socket is fully closed
+                      destination.on("close", (hadError: boolean) => {
+                        // indicate client connection end
+                        self.server.emit(
+                          EVENTS.PROXY_DISCONNECT,
+                          originInfo,
+                          destinationInfo,
+                          hadError
+                        );
+                      });
+
                       // prepare a success response
                       const responseBuffer = Buffer.alloc(
                         args.requestBuffer!.length
@@ -295,62 +353,43 @@ export class SocksServer {
                         destination.pipe(socket);
                         socket.pipe(destination);
                       });
-                    }
-                  );
 
-                  const destinationInfo = {
-                    address: args.dst!.addr!,
-                    port: args.dst!.port!,
-                  };
+                      destination.on(
+                        "error",
+                        (
+                          err: Error & {
+                            code?: string;
+                            addr?: string;
+                            atyp?: number;
+                            port?: number;
+                          }
+                        ) => {
+                          // notify of connection error
+                          err.addr = args.dst!.addr;
+                          err.atyp = args.atyp;
+                          err.port = args.dst!.port;
 
-                  const originInfo = {
-                    address: socket.remoteAddress!,
-                    port: socket.remotePort!,
-                  };
+                          self.server.emit(EVENTS.PROXY_ERROR, err);
 
-                  // capture successful connection
-                  destination.on("connect", () => {
-                    // emit connection event
-                    self.server.emit(
-                      EVENTS.PROXY_CONNECT,
-                      destinationInfo,
-                      destination
-                    );
+                          if (err.code && err.code === "EADDRNOTAVAIL") {
+                            return end(RFC_1928_REPLIES.HOST_UNREACHABLE, args);
+                          }
 
-                    // capture and emit proxied connection data
-                    destination.on("data", (data: Buffer) => {
-                      self.server.emit(EVENTS.PROXY_DATA, data);
-                    });
+                          if (err.code && err.code === "ECONNREFUSED") {
+                            return end(
+                              RFC_1928_REPLIES.CONNECTION_REFUSED,
+                              args
+                            );
+                          }
 
-                    // capture close of destination and emit pending disconnect
-                    // note: this event is only emitted once the destination socket is fully closed
-                    destination.on("close", (hadError: boolean) => {
-                      // indicate client connection end
-                      self.server.emit(
-                        EVENTS.PROXY_DISCONNECT,
-                        originInfo,
-                        destinationInfo,
-                        hadError
+                          return end(
+                            RFC_1928_REPLIES.NETWORK_UNREACHABLE,
+                            args
+                          );
+                        }
                       );
-                    });
-                  });
-
-                  // capture connection errors and response appropriately
-                  destination.on(
-                    "error",
-                    (
-                      err: Error & {
-                        code?: string;
-                        addr?: string;
-                        atyp?: number;
-                        port?: number;
-                      }
-                    ) => {
-                      // notify of connection error
-                      err.addr = args.dst!.addr;
-                      err.atyp = args.atyp;
-                      err.port = args.dst!.port;
-
+                    })
+                    .catch((err) => {
                       self.server.emit(EVENTS.PROXY_ERROR, err);
 
                       if (err.code && err.code === "EADDRNOTAVAIL") {
@@ -362,8 +401,7 @@ export class SocksServer {
                       }
 
                       return end(RFC_1928_REPLIES.NETWORK_UNREACHABLE, args);
-                    }
-                  );
+                    });
                 }
               );
             } else {
